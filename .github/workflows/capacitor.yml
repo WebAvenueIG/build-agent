@@ -1,0 +1,489 @@
+name: Capacitor Build (Reusable)
+
+# ─────────────────────────────────────────────────────────────
+# REUSABLE WORKFLOW — called by individual project repos.
+# Do not trigger this directly. Each project has its own
+# thin build.yml that calls this with project-specific inputs.
+#
+# Secrets are inherited from the calling repo — nothing
+# sensitive lives here.
+# ─────────────────────────────────────────────────────────────
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: '"build + upload" or "build only"'
+        type: string
+        required: true
+        default: 'build + upload'
+      build_android:
+        type: boolean
+        required: false
+        default: true
+      build_ios:
+        type: boolean
+        required: false
+        default: true
+      do_asana:
+        type: boolean
+        required: false
+        default: true
+      do_slack:
+        type: boolean
+        required: false
+        default: true
+      version_name:
+        type: string
+        required: true
+        default: '1.0.0'
+      release_notes:
+        type: string
+        required: false
+        default: 'Bug fixes and performance improvements.'
+      version_code_offset:
+        description: 'Added to github.run_number to produce the build/version code. Set per-project so codes never collide with previously uploaded builds.'
+        type: number
+        required: false
+        default: 100
+
+# ─────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────
+jobs:
+
+  # ───────────────────────────────────────────────────────────
+  # ANDROID
+  # ───────────────────────────────────────────────────────────
+  android:
+    name: Build & Upload Android
+    if: ${{ inputs.build_android }}
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Set up Ruby 3.1.6
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1.6'
+          bundler-cache: true
+
+      - name: Compute version code
+        id: version
+        run: |
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Version code will be: $CODE"
+
+      - name: Decode keystore
+        run: |
+          mkdir -p ci-certs
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ci-certs/release.keystore
+
+      - name: Decode Google Play key
+        run: |
+          echo "${{ secrets.GOOGLE_PLAY_JSON_KEY_BASE64 }}" | base64 -d > ci-certs/google-play-key.json
+
+      - name: Decode google-services.json
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+            echo "$GOOGLE_SERVICES_JSON_BASE64" | base64 -d > android/app/google-services.json
+            echo "✓ google-services.json decoded"
+          else
+            echo "⚠ GOOGLE_SERVICES_JSON_BASE64 not set, skipping Firebase setup"
+          fi
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build React app
+        run: npm run build
+
+      - name: Capacitor sync
+        run: npx cap sync android
+
+      - name: Write release notes
+        run: |
+          mkdir -p fastlane/metadata/android/en-US/changelogs
+          NOTES="${{ inputs.release_notes }}"
+          if [ -z "$NOTES" ]; then
+            NOTES="Bug fixes and performance improvements."
+          fi
+          echo "$NOTES" > fastlane/metadata/android/en-US/changelogs/${{ steps.version.outputs.code }}.txt
+          echo "✓ Release notes written"
+
+      - name: Run fastlane
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          ANDROID_PACKAGE_NAME: ${{ vars.ANDROID_PACKAGE_NAME }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/ci-certs/release.keystore
+          ANDROID_KEYSTORE_ALIAS: ${{ vars.ANDROID_KEYSTORE_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          GOOGLE_PLAY_JSON_KEY_PATH: ${{ github.workspace }}/ci-certs/google-play-key.json
+          GOOGLE_PLAY_TRACK: ${{ vars.GOOGLE_PLAY_TRACK }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
+        run: |
+          if [ "${{ inputs.action }}" = "build + upload" ]; then
+            bundle exec fastlane android ship
+          else
+            bundle exec fastlane android build_apk
+          fi
+
+      - name: Upload APK artifact
+        if: inputs.action == 'build only'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.version_name }}-${{ steps.version.outputs.code }}.apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 7
+
+
+  # ───────────────────────────────────────────────────────────
+  # iOS
+  # ───────────────────────────────────────────────────────────
+  ios:
+    name: Build & Upload iOS
+    if: ${{ inputs.build_ios && inputs.action == 'build + upload' }}
+    runs-on: macos-15
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode 26
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Set up Ruby 3.1.6
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1.6'
+          bundler-cache: false
+
+      - name: Install gems
+        run: |
+          bundle lock --add-platform $(ruby -e "puts Gem::Platform.local.to_s")
+          bundle install --jobs 3
+
+      - name: Install CocoaPods 1.16.2
+        run: |
+          gem install cocoapods -v 1.16.2
+          pod --version
+
+      - name: Compute version code
+        id: version
+        run: |
+          CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          echo "code=$CODE" >> $GITHUB_OUTPUT
+          echo "Version code will be: $CODE"
+
+      - name: Decode Apple API key
+        run: |
+          mkdir -p ci-certs
+          echo "${{ secrets.APPLE_API_KEY_BASE64 }}" | base64 -d > ci-certs/apple-api-key.p8
+
+      - name: Decode Distribution Certificate
+        run: |
+          echo "${{ secrets.APPLE_DIST_CERT_BASE64 }}" | base64 -d > ci-certs/dist-cert.p12
+
+      - name: Decode Provisioning Profile
+        run: |
+          echo "${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}" | base64 -d > ci-certs/profile.mobileprovision
+
+      - name: Install Certificate into Keychain
+        env:
+          CERT_PASSWORD: ${{ secrets.APPLE_DIST_CERT_PASSWORD }}
+        run: |
+          security create-keychain -p "" build.keychain
+          security list-keychain -d user -s build.keychain $(security list-keychain -d user | sed s/\"//g)
+          security set-keychain-settings -t 3600 -u build.keychain
+          security unlock-keychain -p "" build.keychain
+          security import ci-certs/dist-cert.p12 \
+            -k build.keychain \
+            -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+          echo "✓ Certificate installed into build.keychain"
+
+      - name: Install Provisioning Profile
+        id: profile
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          security cms -D -i ci-certs/profile.mobileprovision > /tmp/profile.plist
+          PROFILE_UUID=$(plutil -extract UUID raw /tmp/profile.plist)
+          PROFILE_NAME=$(plutil -extract Name raw /tmp/profile.plist)
+          cp ci-certs/profile.mobileprovision \
+            ~/Library/MobileDevice/Provisioning\ Profiles/$PROFILE_UUID.mobileprovision
+          echo "profile_name=$PROFILE_NAME" >> $GITHUB_OUTPUT
+          echo "✓ Profile installed: $PROFILE_NAME ($PROFILE_UUID)"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build React app
+        run: npm run build
+
+      - name: Capacitor sync
+        run: npx cap sync ios
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios/App
+        run: pod install
+
+      - name: Run fastlane ios ship
+        env:
+          APP_NAME: ${{ vars.APP_NAME }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          IOS_SCHEME: ${{ vars.IOS_SCHEME }}
+          TESTFLIGHT_GROUPS: ${{ vars.TESTFLIGHT_GROUPS }}
+          APPLE_API_KEY_PATH: ${{ github.workspace }}/ci-certs/apple-api-key.p8
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          IOS_PROVISIONING_PROFILE_NAME: ${{ steps.profile.outputs.profile_name }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          CAPACITOR_PROJECT_PATH: ${{ github.workspace }}
+        run: bundle exec fastlane ios ship
+
+
+  # ───────────────────────────────────────────────────────────
+  # NOTIFY
+  # ───────────────────────────────────────────────────────────
+  notify:
+    name: Notify
+    needs: [android, ios]
+    if: >
+      always() &&
+      (needs.android.result != 'skipped' || needs.ios.result != 'skipped') &&
+      (inputs.do_slack || (inputs.do_asana && inputs.action == 'build + upload'))
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Create Android Asana QA task
+        id: asana_android
+        if: needs.android.result == 'success' && inputs.do_asana && inputs.action == 'build + upload'
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [Android] ${VERSION_CODE}(${VERSION_NAME}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          if [ -n "$ASANA_PROJECT_ID" ]; then
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
+          else
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
+          fi
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"data\": {
+                \"name\": \"${TASK_NAME}\",
+                \"notes\": \"Release Notes:\n${RELEASE_NOTES}\",
+                \"projects\": ${PROJECTS},
+                \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
+              }
+            }")
+
+          TASK_GID=$(echo $TASK_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['gid'])" 2>/dev/null)
+
+          if [ -z "$TASK_GID" ]; then
+            echo "⚠ Failed to create Android Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> $GITHUB_OUTPUT
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ Android Asana task created: ${TASK_URL}"
+            echo "task_url=${TASK_URL}" >> $GITHUB_OUTPUT
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      - name: Create iOS Asana QA task
+        id: asana_ios
+        if: needs.ios.result == 'success' && inputs.do_asana && inputs.action == 'build + upload'
+        env:
+          ASANA_ACCESS_TOKEN: ${{ secrets.ASANA_ACCESS_TOKEN }}
+          ASANA_TASK_LABEL: ${{ vars.ASANA_TASK_LABEL }}
+          ASANA_QA_PROJECT_ID: ${{ vars.ASANA_QA_PROJECT_ID }}
+          ASANA_PROJECT_ID: ${{ vars.ASANA_PROJECT_ID }}
+          ASANA_ASSIGNEE_ID: ${{ vars.ASANA_ASSIGNEE_ID }}
+          ASANA_COLLABORATOR_IDS: ${{ vars.ASANA_COLLABORATOR_IDS }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          TASK_NAME="[Build] ${ASANA_TASK_LABEL} | [iOS] ${VERSION_CODE}(${VERSION_NAME}) QA"
+          echo "Creating Asana task: $TASK_NAME"
+
+          if [ -n "$ASANA_PROJECT_ID" ]; then
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\", \"${ASANA_PROJECT_ID}\"]"
+          else
+            PROJECTS="[\"${ASANA_QA_PROJECT_ID}\"]"
+          fi
+
+          TASK_RESPONSE=$(curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"data\": {
+                \"name\": \"${TASK_NAME}\",
+                \"notes\": \"Release Notes:\n${RELEASE_NOTES}\",
+                \"projects\": ${PROJECTS},
+                \"assignee\": \"${ASANA_ASSIGNEE_ID}\"
+              }
+            }")
+
+          TASK_GID=$(echo $TASK_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['gid'])" 2>/dev/null)
+
+          if [ -z "$TASK_GID" ]; then
+            echo "⚠ Failed to create iOS Asana task. Response: $TASK_RESPONSE"
+            echo "task_url=" >> $GITHUB_OUTPUT
+          else
+            TASK_URL="https://app.asana.com/0/${ASANA_QA_PROJECT_ID}/${TASK_GID}"
+            echo "✓ iOS Asana task created: ${TASK_URL}"
+            echo "task_url=${TASK_URL}" >> $GITHUB_OUTPUT
+
+            if [ -n "$ASANA_COLLABORATOR_IDS" ]; then
+              IFS=',' read -ra COLLABS <<< "$ASANA_COLLABORATOR_IDS"
+              FOLLOWERS_JSON=$(printf '"%s",' "${COLLABS[@]}" | sed 's/,$//')
+              curl -s -X POST "https://app.asana.com/api/1.0/tasks/${TASK_GID}/addFollowers" \
+                -H "Authorization: Bearer ${ASANA_ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"data\": {\"followers\": [${FOLLOWERS_JSON}]}}" > /dev/null
+              echo "✓ Collaborators added"
+            fi
+          fi
+
+      - name: Slack notification
+        if: always() && inputs.do_slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+          SLACK_ANDROID_DOWNLOAD_URL: ${{ vars.SLACK_ANDROID_DOWNLOAD_URL }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+          ANDROID_TASK_URL: ${{ steps.asana_android.outputs.task_url }}
+          IOS_TASK_URL: ${{ steps.asana_ios.outputs.task_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          VERSION_CODE=$((${{ inputs.version_code_offset }} + ${{ github.run_number }}))
+          ANDROID_RESULT="${{ needs.android.result }}"
+          IOS_RESULT="${{ needs.ios.result }}"
+          ACTION="${{ inputs.action }}"
+
+          PLATFORMS=""
+          ALL_SUCCESS=true
+
+          if [ "$ANDROID_RESULT" != "skipped" ]; then
+            if [ "$ANDROID_RESULT" = "success" ]; then
+              PLATFORMS="Android"
+            else
+              PLATFORMS="Android :x:"
+              ALL_SUCCESS=false
+            fi
+          fi
+
+          if [ "$IOS_RESULT" != "skipped" ]; then
+            if [ "$IOS_RESULT" = "success" ]; then
+              IOS_LABEL="iOS"
+            else
+              IOS_LABEL="iOS :x:"
+              ALL_SUCCESS=false
+            fi
+            if [ -n "$PLATFORMS" ]; then
+              PLATFORMS="${PLATFORMS} + ${IOS_LABEL}"
+            else
+              PLATFORMS="${IOS_LABEL}"
+            fi
+          fi
+
+          if [ "$ALL_SUCCESS" = "true" ]; then
+            if [ "$ACTION" = "build only" ]; then
+              MESSAGE="Hello <!channel>\n:package: *${APP_NAME} — ${PLATFORMS} (build only)*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:memo: Release Details\n• ${RELEASE_NOTES}"
+              MESSAGE="${MESSAGE}\n\n:arrow_down: APK: <${RUN_URL}|Download from workflow run> _(Artifacts section at the bottom)_"
+            else
+              MESSAGE="Hello <!channel>\n:white_check_mark: *${APP_NAME} — ${PLATFORMS}*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:memo: Release Details\n• ${RELEASE_NOTES}"
+
+              if [ "$ANDROID_RESULT" = "success" ]; then
+                ANDROID_LINE="\n\n:robot_face: Android → Play Store internal track"
+                if [ -n "$SLACK_ANDROID_DOWNLOAD_URL" ]; then
+                  ANDROID_LINE="${ANDROID_LINE} | <${SLACK_ANDROID_DOWNLOAD_URL}|Download>"
+                fi
+                MESSAGE="${MESSAGE}${ANDROID_LINE}"
+              fi
+
+              if [ "$IOS_RESULT" = "success" ]; then
+                MESSAGE="${MESSAGE}\n:apple: iOS → TestFlight"
+              fi
+
+              if [ -n "$ANDROID_TASK_URL" ]; then
+                MESSAGE="${MESSAGE}\n:pushpin: Android QA: <${ANDROID_TASK_URL}|View task>"
+              fi
+              if [ -n "$IOS_TASK_URL" ]; then
+                MESSAGE="${MESSAGE}\n:pushpin: iOS QA: <${IOS_TASK_URL}|View task>"
+              fi
+            fi
+          else
+            MESSAGE="Hello <!channel>\n:x: *${APP_NAME} — Build failed (${PLATFORMS})*\n\n:package: Version: ${VERSION_NAME} (${VERSION_CODE})\n:mag: <${RUN_URL}|View logs>"
+          fi
+
+          curl -s -X POST "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"channel\": \"${SLACK_CHANNEL_ID}\",
+              \"text\": \"${MESSAGE}\"
+            }" > /dev/null
+          echo "✓ Slack notification sent"
