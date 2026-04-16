@@ -1,5 +1,6 @@
 # Local secrets — never commit
 .secrets.env
+*/.secrets.env
 
 # macOS
 .DS_Store
