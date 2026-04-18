@@ -46,6 +46,11 @@ on:
         type: number
         required: false
         default: 100
+      pre_build_cleanup:
+        description: 'Newline-separated asset paths to delete before the Unity build runs. Useful for editor-only scripts that reference Windows/macOS-only DLLs and break on Linux CI (e.g. Assets/DevToDev/Analytics/Window). Paths are relative to the repo root. Matching .meta files are also removed.'
+        type: string
+        required: false
+        default: ''
 
 # ─────────────────────────────────────────────────────────────
 # JOBS
@@ -78,6 +83,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+
+      # Remove editor-only scripts that break on Linux CI (e.g. DevToDev's
+      # Window scripts reference a Windows-Editor-only DLL). Caller declares
+      # paths via the pre_build_cleanup input; we delete them plus their .meta.
+      - name: Pre-build cleanup
+        if: inputs.pre_build_cleanup != ''
+        env:
+          CLEANUP_PATHS: ${{ inputs.pre_build_cleanup }}
+        run: |
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if [ -e "$path" ]; then
+              rm -rf "$path"
+              [ -e "${path}.meta" ] && rm -f "${path}.meta"
+              echo "✓ Removed: $path"
+            else
+              echo "⚠ Not found (skipping): $path"
+            fi
+          done <<< "$CLEANUP_PATHS"
 
       - name: Detect Unity version
         id: unity
@@ -222,6 +246,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+
+      - name: Pre-build cleanup
+        if: inputs.pre_build_cleanup != ''
+        env:
+          CLEANUP_PATHS: ${{ inputs.pre_build_cleanup }}
+        run: |
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if [ -e "$path" ]; then
+              rm -rf "$path"
+              [ -e "${path}.meta" ] && rm -f "${path}.meta"
+              echo "✓ Removed: $path"
+            else
+              echo "⚠ Not found (skipping): $path"
+            fi
+          done <<< "$CLEANUP_PATHS"
 
       - name: Detect Unity version
         id: unity
