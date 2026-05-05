@@ -309,6 +309,18 @@ jobs:
               -executeMethod Builder.BuildIOS \
               -logFile -
 
+      # Unlock the login keychain so xcodebuild can read the Apple
+      # Distribution cert that Xcode added when you signed into your
+      # Apple ID. Without this, xcodebuild fails with "User interaction
+      # is not allowed" because launchd-spawned jobs can't prompt.
+      - name: Unlock login keychain
+        env:
+          MAC_LOGIN_PASSWORD: ${{ secrets.MAC_LOGIN_PASSWORD }}
+        run: |
+          security unlock-keychain -p "$MAC_LOGIN_PASSWORD" ~/Library/Keychains/login.keychain-db
+          # Allow codesign/xcodebuild to use signing keys without further prompts
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MAC_LOGIN_PASSWORD" ~/Library/Keychains/login.keychain-db 2>/dev/null || true
+
       # API key is still needed for fastlane TestFlight upload.
       # Cert + provisioning profile are NOT decoded here — automatic
       # signing on the mini uses the Apple ID signed into Xcode.
